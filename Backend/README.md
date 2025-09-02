@@ -1,4 +1,4 @@
-# 📘 Fraud Detection Project
+#  Fraud Detection Project
 
 This project focuses on detecting fraudulent financial transactions using data preprocessing, exploratory data analysis (EDA), and a FastAPI backend API.
 
@@ -79,6 +79,7 @@ A FastAPI backend that connects to a MySQL database and exposes transaction data
    uvicorn app:app --reload
 
 3. Access docs: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+
 
 
 
