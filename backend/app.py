@@ -7,14 +7,16 @@ from datetime import datetime
 import pandas as pd
 import pymysql
 from pydantic import BaseModel
+import joblib
+import numpy as np
 
 # ===============================
 # Database Config
 # ===============================
 DB_USER = "root"
-DB_PASS = "subhash"  # Change if needed
+DB_PASS = "1234"  # Change if needed
 DB_HOST = "127.0.0.1"
-DB_PORT = "8080"     
+DB_PORT = "3306"
 DB_NAME = "fraud_detection"
 
 DATABASE_URL = f"mysql+pymysql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
@@ -30,7 +32,6 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # ===============================
 # Models
 # ===============================
-
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
@@ -58,22 +59,19 @@ class Transaction(Base):
     weekday = Column(Integer)
     is_high_value = Column(Integer)
 
-# Uncomment if you want to auto-create tables (optional)
+# Uncomment for auto-create tables
 # Base.metadata.create_all(bind=engine)
 
 # ===============================
-# Pydantic Models for Validation
+# Pydantic Models
 # ===============================
-
-class TransactionCreate(BaseModel):
-    transaction_id: str
+class TransactionPredict(BaseModel):
     customer_id: str
     kyc_verified: str
     account_age_days: int
     transaction_amount: float
     channel: str
     timestamp: str
-    is_fraud: int
     hour: int
     day: int
     month: int
@@ -85,13 +83,24 @@ class TransactionCreate(BaseModel):
 # ===============================
 app = FastAPI()
 
-# Dependency to get DB session
+# Dependency
 def get_db():
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
+
+# ===============================
+# Load Model
+# ===============================
+try:
+    model_bundle = joblib.load("fraud_model.pkl")
+    model = model_bundle["model"]
+    encoders = model_bundle["encoders"]
+except Exception as e:
+    model, encoders = None, {}
+    print(f"⚠️ Warning: Could not load model - {e}")
 
 # ===============================
 # Auth Routes
@@ -135,7 +144,6 @@ def login(email: str = Form(...), password: str = Form(...), db: Session = Depen
 # ===============================
 # Transaction Routes
 # ===============================
-
 @app.get("/")
 def root():
     return {"message": "Welcome to Fraud Detection API"}
@@ -150,12 +158,98 @@ def get_transactions(limit: int = Query(10, ge=1)):
     return df.to_dict(orient="records")
 
 @app.post("/api/transactions")
-def add_transaction(transaction: TransactionCreate):
+def add_transaction(transaction: TransactionPredict):
+    if not model:
+        raise HTTPException(status_code=500, detail="Model not loaded")
+
     try:
-        df = pd.DataFrame([transaction.dict()])
-        # Use engine.begin() to ensure commit
+        data = transaction.dict()
+        df = pd.DataFrame([data])
+
+        # Apply label encoders
+        for col, le in encoders.items():
+            if col in df.columns:
+                df[col] = le.transform(df[col].astype(str))
+
+        # Run prediction
+        prediction = model.predict(df)[0]
+        probability = model.predict_proba(df)[0][1]
+
+        # Add prediction result
+        data["is_fraud"] = int(prediction)
+        df_final = pd.DataFrame([data])
+
         with engine.begin() as conn:
-            df.to_sql("transactions", con=conn, if_exists="append", index=False)
-        return {"message": "Transaction added successfully!"}
+            df_final.to_sql("transactions", con=conn, if_exists="append", index=False)
+
+        return {
+            "message": "Transaction added successfully!",
+            "prediction": int(prediction),
+            "fraud_probability": float(probability)
+        }
+
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error adding transaction: {e}")
+
+# ===============================
+# Prediction API
+# ===============================
+@app.post("/api/predict")
+def predict_fraud(transaction: TransactionPredict):
+    if not model:
+        raise HTTPException(status_code=500, detail="Model not loaded")
+
+    try:
+        data = transaction.dict()
+        df = pd.DataFrame([data])
+
+        # Apply label encoders
+        for col, le in encoders.items():
+            if col in df.columns:
+                df[col] = le.transform(df[col].astype(str))
+
+        prediction = model.predict(df)[0]
+        probability = model.predict_proba(df)[0][1]
+
+        return {
+            "prediction": int(prediction),
+            "fraud_probability": float(probability)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Prediction error: {e}")
+
+# ===============================
+# Fraud Alerts API
+# ===============================
+@app.get("/api/fraud-alerts")
+def get_fraud_alerts(limit: int = Query(10, ge=1)):
+    query = text(f"SELECT * FROM transactions WHERE is_fraud = 1 ORDER BY timestamp DESC LIMIT {limit}")
+    with engine.connect() as conn:
+        df = pd.read_sql(query, conn)
+    if df.empty:
+        return {"message": "No fraud alerts found"}
+    return df.to_dict(orient="records")
+
+# ===============================
+# Fraud Stats API
+# ===============================
+@app.get("/api/fraud-stats")
+def fraud_stats():
+    query = text("SELECT is_fraud, COUNT(*) as count FROM transactions GROUP BY is_fraud")
+    with engine.connect() as conn:
+        df = pd.read_sql(query, conn)
+
+    if df.empty:
+        return {"message": "No transactions available"}
+
+    total = int(df["count"].sum())
+    fraud = int(df.loc[df["is_fraud"] == 1, "count"].sum()) if 1 in df["is_fraud"].values else 0
+    legit = int(df.loc[df["is_fraud"] == 0, "count"].sum()) if 0 in df["is_fraud"].values else 0
+
+    return {
+        "total_transactions": total,
+        "fraud_transactions": fraud,
+        "legit_transactions": legit,
+        "fraud_percentage": round((fraud / total) * 100, 2) if total > 0 else 0
+    }
+
